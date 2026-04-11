@@ -1,5 +1,7 @@
 # virtual environments
 .mujoco_env
 .mujoco_env/
+mujoco_env/
+mujoco_env
 venv/
 .venv/
