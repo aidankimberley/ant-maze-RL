@@ -10,10 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# import tyro
-#from torch.utils.tensorboard import SummaryWriter
+import tyro
+from torch.utils.tensorboard import SummaryWriter
 
-#from cleanrl_utils.buffers import ReplayBuffer
+# from cleanrl_utils.buffers import ReplayBuffer
 
 
 @dataclass
@@ -152,6 +152,7 @@ class Actor(nn.Module):
 
 
 if __name__ == "__main__":
+    pass
 
     # args = tyro.cli(Args)
     # run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"

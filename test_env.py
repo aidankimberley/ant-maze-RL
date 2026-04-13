@@ -3,7 +3,7 @@ import gymnasium_robotics
 
 gym.register_envs(gymnasium_robotics)
 
-env = gym.make("AntMaze_UMaze-v5", render_mode="human", max_episode_steps=100)
+env = gym.make("AntMaze_UMaze-v5", render_mode="human", max_episode_steps=1000)
 env.reset()
 for i in range(5000):
     action = env.action_space.sample()
