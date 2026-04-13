@@ -1,0 +1,14 @@
+# OGBench reference HIQL training (JAX). With env active, e.g.:
+#   source mujoco_env/bin/activate
+# Use Python 3.10+ in that venv so `pip install ogbench` can use prebuilt mujoco wheels.
+# Linux + NVIDIA (CUDA 12): replace the jax line with: jax[cuda12]>=0.4.26
+ogbench>=1.2.0
+jax>=0.4.26
+flax>=0.8.4
+distrax>=0.1.5,<0.1.6  # 0.1.6+ needs jaxlib>=0.7 (unavailable on Intel macOS)
+ml_collections
+matplotlib
+moviepy
+wandb
+absl-py
+tqdm
