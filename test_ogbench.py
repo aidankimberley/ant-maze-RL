@@ -41,7 +41,7 @@ CONFIG = {
     # "eval_episodes": 50,        # episodes per eval
     # "save_interval": 250_000,   # how often to checkpoint
 
-    "train_steps": 1000,
+    "train_steps": 300_000,
     "batch_size": 512,
     "eval_interval": 100_000,
     "eval_episodes": 10,
