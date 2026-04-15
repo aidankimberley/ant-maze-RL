@@ -202,6 +202,7 @@ def save_checkpoint(agent, step: int, save_dir: str):
 
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"checkpoint_{step}")
+    os.makedirs(path, exist_ok=True)
     save_agent(agent, path, step)
     print(f"  [checkpoint] Saved to {path}")
 
