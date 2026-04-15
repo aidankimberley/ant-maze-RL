@@ -31,16 +31,24 @@ import numpy as np
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG = {
     # Environment / dataset
-    "env_name": "antmaze-large-navigate-v0",  # change to antmaze-medium-navigate-v0 for faster runs
+    "env_name": "antmaze-medium-navigate-v0",  # change to antmaze-medium-navigate-v0 for faster runs
     "seed": 0,
 
-    # Training
-    "train_steps": 1_000_000,
-    "batch_size": 1024,
-    "eval_interval": 50_000,    # how often to run evaluation rollouts
-    "eval_episodes": 50,        # episodes per eval
-    "save_interval": 250_000,   # how often to checkpoint
-    "save_dir": "./experiments",
+    # # Training
+    # "train_steps": 1_000_000,
+    # "batch_size": 1024,
+    # "eval_interval": 50_000,    # how often to run evaluation rollouts
+    # "eval_episodes": 50,        # episodes per eval
+    # "save_interval": 250_000,   # how often to checkpoint
+
+    "train_steps": 1000,
+    "batch_size": 512,
+    "eval_interval": 100_000,
+    "eval_episodes": 10,
+    "save_interval": 500_000,
+
+
+    "save_dir": "/content/drive/MyDrive/hiql_experiments",
 
     # HIQL hyperparameters (tuned for AntMaze navigate, from OGBench paper)
     "subgoal_steps": 25,        # k: how many steps ahead the high-level policy looks
@@ -194,7 +202,7 @@ def save_checkpoint(agent, step: int, save_dir: str):
 
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"checkpoint_{step}")
-    save_agent(agent, path)
+    save_agent(agent, path, step)
     print(f"  [checkpoint] Saved to {path}")
 
 
