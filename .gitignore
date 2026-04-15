@@ -6,3 +6,4 @@ mujoco_env
 venv/
 .venv/
 ogbench/
+OGBench/
