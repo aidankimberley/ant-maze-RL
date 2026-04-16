@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+test_online_transfer.py
+
+Online fine-tuning starting from an offline OGBench HIQL checkpoint.
+
+Two modes:
+- online_hiql: keep acting with HIQL and update HIQL online using HGC-style relabeling.
+- pex: "policy expansion" by training an online SAC policy on (obs, goal) while executing a
+  convex combination of (frozen) HIQL and SAC actions with a ramped mixing coefficient.
+
+Example:
+PYTHONPATH="$(pwd)/ogbench:$PYTHONPATH" python test_online_transfer.py \
+  --checkpoint_dir ./experiments/checkpoint_300000 \
+  --step 300000 \
+  --env_name antmaze-medium-navigate-v0 \
+  --task_id 1 \
+  --method online_hiql \
+  --total_steps 20000
+"""
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import jax
+import numpy as np
+
+
+def setup_imports():
+    impls_dir = os.environ.get("OGBENCH_IMPLS", "")
+    if not impls_dir:
+        this_file = os.path.abspath(__file__)
+        impls_dir = os.path.join(os.path.dirname(this_file), "ogbench", "impls")
+
+    impls_dir = os.path.abspath(impls_dir)
+    repo_dir = os.path.dirname(impls_dir)
+
+    if not os.path.isdir(impls_dir):
+        raise FileNotFoundError(f"Could not find ogbench/impls at: {impls_dir}")
+
+    for p in (repo_dir, impls_dir):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    print(f"[setup] ogbench/impls loaded from: {impls_dir}")
+
+
+def build_hiql_agent_config(overrides: dict):
+    from agents.hiql import get_config
+
+    cfg = get_config()
+    # State-based AntMaze in OGBench: encoder=None, frame_stack=None
+    cfg.encoder = None
+    cfg.frame_stack = None
+    for k, v in overrides.items():
+        cfg[k] = v
+    return cfg
+
+
+def make_agent(agent_name: str, env, seed: int, agent_cfg):
+    from agents import agents as agent_registry
+
+    ex_obs = np.asarray([env.observation_space.sample()], dtype=np.float32)
+    ex_act = np.asarray([env.action_space.sample()], dtype=np.float32)
+
+    agent_cls = agent_registry[agent_name]
+    return agent_cls.create(seed, ex_obs, ex_act, agent_cfg)
+
+
+@dataclass
+class OnlineEpisodesIndex:
+    """
+    Tracks episode boundaries for a growing, non-circular buffer.
+    """
+
+    episode_end: np.ndarray  # shape (max_size,), int32 (filled for [0, size))
+    size: int = 0
+    cur_ep_start: int = 0
+
+    def start_new_episode(self):
+        self.cur_ep_start = self.size
+
+    def push_and_maybe_close_episode(self, done: bool):
+        self.size += 1
+        if done:
+            end = self.size - 1
+            self.episode_end[self.cur_ep_start : end + 1] = end
+            self.cur_ep_start = self.size
+
+
+def _geom_offsets(discount: float, n: int) -> np.ndarray:
+    # matches ogbench/impls/utils/datasets.py geometric sampling in spirit
+    p = 1.0 - float(discount)
+    p = np.clip(p, 1e-6, 1.0)
+    return np.random.geometric(p=p, size=n).astype(np.int64)  # in [1, inf)
+
+
+def sample_hgc_batch(buffer, idx: OnlineEpisodesIndex, batch_size: int, cfg) -> dict:
+    """
+    Online version of HGCDataset.sample() that works on a growing buffer.
+
+    Produces the exact keys HIQL expects:
+      observations, actions, next_observations, rewards, masks,
+      value_goals, low_actor_goals, high_actor_goals, high_actor_targets
+    """
+    n = idx.size
+    if n < 2:
+        raise RuntimeError("Not enough online data yet to sample a batch.")
+
+    # only sample indices whose episode_end is known (i.e., episode finished)
+    # otherwise we can't safely sample future goals within the episode.
+    valid = np.nonzero(idx.episode_end[:n] >= 0)[0]
+    if len(valid) == 0:
+        raise RuntimeError("No completed episodes in buffer yet.")
+
+    idxs = valid[np.random.randint(len(valid), size=batch_size)]
+    final_state_idxs = idx.episode_end[idxs]
+
+    # Value goals: mix of current / future-in-episode / random.
+    random_goal_idxs = valid[np.random.randint(len(valid), size=batch_size)]
+
+    if cfg["value_geom_sample"]:
+        offsets = _geom_offsets(cfg["discount"], batch_size)
+        traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+    else:
+        distances = np.random.rand(batch_size)
+        lo = np.minimum(idxs + 1, final_state_idxs)
+        hi = final_state_idxs
+        traj_goal_idxs = np.round(lo * distances + hi * (1.0 - distances)).astype(np.int64)
+
+    # choose between traj and random for the (1 - p_curgoal) mass, then sprinkle in curgoal
+    if float(cfg["value_p_curgoal"]) == 1.0:
+        value_goal_idxs = idxs
+    else:
+        pick_traj = np.random.rand(batch_size) < (cfg["value_p_trajgoal"] / (1.0 - cfg["value_p_curgoal"]))
+        value_goal_idxs = np.where(pick_traj, traj_goal_idxs, random_goal_idxs)
+        pick_cur = np.random.rand(batch_size) < cfg["value_p_curgoal"]
+        value_goal_idxs = np.where(pick_cur, idxs, value_goal_idxs)
+
+    successes = (idxs == value_goal_idxs).astype(np.float32)
+    masks = 1.0 - successes
+    rewards = successes - (1.0 if cfg["gc_negative"] else 0.0)
+
+    # Low-level goals are fixed subgoal_steps into the future (clamped to episode end).
+    low_goal_idxs = np.minimum(idxs + int(cfg["subgoal_steps"]), final_state_idxs)
+
+    # High-level actor goals/targets.
+    if cfg["actor_geom_sample"]:
+        offsets = _geom_offsets(cfg["discount"], batch_size)
+        high_traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+    else:
+        distances = np.random.rand(batch_size)
+        lo = np.minimum(idxs + 1, final_state_idxs)
+        hi = final_state_idxs
+        high_traj_goal_idxs = np.round(lo * distances + hi * (1.0 - distances)).astype(np.int64)
+
+    high_traj_target_idxs = np.minimum(idxs + int(cfg["subgoal_steps"]), high_traj_goal_idxs)
+
+    high_random_goal_idxs = valid[np.random.randint(len(valid), size=batch_size)]
+    high_random_target_idxs = np.minimum(idxs + int(cfg["subgoal_steps"]), final_state_idxs)
+
+    pick_random = np.random.rand(batch_size) < cfg["actor_p_randomgoal"]
+    high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
+    high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+
+    # Gather data from the underlying ReplayBuffer (a FrozenDict-like Dataset).
+    batch = buffer.sample(batch_size, idxs)
+    batch["rewards"] = rewards.astype(np.float32)
+    batch["masks"] = masks.astype(np.float32)
+    batch["value_goals"] = buffer["observations"][value_goal_idxs]
+    batch["low_actor_goals"] = buffer["observations"][low_goal_idxs]
+    batch["high_actor_goals"] = buffer["observations"][high_goal_idxs]
+    batch["high_actor_targets"] = buffer["observations"][high_target_idxs]
+    return batch
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint_dir", type=str, required=True)
+    parser.add_argument("--step", type=int, required=True)
+    parser.add_argument("--env_name", type=str, default="antmaze-medium-navigate-v0")
+    parser.add_argument("--task_id", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--method", type=str, default="online_hiql", choices=["online_hiql", "pex"])
+    parser.add_argument("--total_steps", type=int, default=20_000)
+    parser.add_argument("--start_updates_after", type=int, default=1_000)
+    parser.add_argument("--updates_per_step", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--action_noise", type=float, default=0.1)
+    parser.add_argument("--eval_every", type=int, default=5_000)
+    parser.add_argument("--eval_episodes", type=int, default=5)
+    parser.add_argument("--save_dir", type=str, default=None, help="Where to save final fine-tuned weights.")
+    # PEX knobs (SAC expansion)
+    parser.add_argument("--pex_mix_final", type=float, default=0.8)
+    parser.add_argument("--pex_mix_warmup", type=int, default=5_000)
+    parser.add_argument("--sac_batch_size", type=int, default=256)
+    args = parser.parse_args()
+
+    checkpoint_dir = Path(args.checkpoint_dir).resolve()
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint dir not found: {checkpoint_dir}")
+    ckpt_file = checkpoint_dir / f"params_{args.step}.pkl"
+    if not ckpt_file.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+
+    setup_imports()
+
+    import ogbench
+    from utils.flax_utils import restore_agent, save_agent
+    from utils.evaluation import evaluate as ogbench_evaluate
+    from utils.datasets import ReplayBuffer
+
+    print(f"[env] Creating: {args.env_name}")
+    env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
+    obs, info = env.reset(seed=args.seed, options=dict(task_id=args.task_id))
+    goal = info.get("goal")
+
+    # HIQL config: mirror the same knobs used in offline runs.
+    hiql_cfg = build_hiql_agent_config(
+        overrides=dict(
+            batch_size=args.batch_size,
+            subgoal_steps=25,
+            expectile=0.7,
+            high_alpha=3.0,
+            low_alpha=3.0,
+            actor_p_trajgoal=0.5,
+            actor_p_randomgoal=0.5,
+            actor_geom_sample=True,
+            discount=0.99,
+        )
+    )
+    hiql_agent = make_agent("hiql", env, args.seed, hiql_cfg)
+    hiql_agent = restore_agent(hiql_agent, str(checkpoint_dir), args.step)
+    print(f"[restore] HIQL restored from {checkpoint_dir} @ step {args.step}")
+
+    # Online buffers.
+    # We use a non-circular buffer sized to total_steps (+ a little room) so episode indexing is simple.
+    max_buf = int(args.total_steps) + 10_000
+    example_transition = dict(
+        observations=np.asarray(obs, dtype=np.float32),
+        actions=np.asarray(env.action_space.sample(), dtype=np.float32),
+        rewards=np.asarray(0.0, dtype=np.float32),
+        masks=np.asarray(1.0, dtype=np.float32),
+        terminals=np.asarray(0.0, dtype=np.float32),
+        next_observations=np.asarray(obs, dtype=np.float32),
+    )
+    rb = ReplayBuffer.create(example_transition, size=max_buf)
+    ep_index = OnlineEpisodesIndex(episode_end=np.full((max_buf,), -1, dtype=np.int32))
+    ep_index.start_new_episode()
+
+    # PEX/SAC agent (trained online on concatenated (obs, goal) as "observation")
+    sac_agent = None
+    sac_rb = None
+    if args.method == "pex":
+        from agents.sac import get_config as sac_get_config
+
+        if goal is None:
+            raise RuntimeError("PEX mode requires env to provide info['goal'].")
+        sac_cfg = sac_get_config()
+        sac_cfg.batch_size = args.sac_batch_size
+
+        ex_obs_sac = np.concatenate([np.asarray(obs, np.float32), np.asarray(goal, np.float32)], axis=-1)
+        ex_obs_sac = ex_obs_sac[None, :]
+        ex_act = np.asarray([env.action_space.sample()], dtype=np.float32)
+        from agents.sac import SACAgent
+
+        sac_agent = SACAgent.create(args.seed, ex_obs_sac, ex_act, sac_cfg)
+
+        sac_example = dict(
+            observations=ex_obs_sac[0].astype(np.float32),
+            actions=ex_act[0].astype(np.float32),
+            rewards=np.asarray(0.0, dtype=np.float32),
+            masks=np.asarray(1.0, dtype=np.float32),
+            next_observations=ex_obs_sac[0].astype(np.float32),
+        )
+        sac_rb = ReplayBuffer.create(sac_example, size=max_buf)
+
+    def eval_hiql(step: int):
+        stats, _, _ = ogbench_evaluate(
+            hiql_agent,
+            env,
+            task_id=args.task_id,
+            config=hiql_cfg,
+            num_eval_episodes=args.eval_episodes,
+            num_video_episodes=0,
+        )
+        succ = float(stats.get("success", 0.0))
+        print(f"[eval] step={step} success={succ:.3f}")
+
+    total_env_steps = 0
+    episode_return = 0.0
+    episode_len = 0
+    rng = jax.random.PRNGKey(args.seed)
+
+    print(f"[run] method={args.method} total_steps={args.total_steps}")
+    while total_env_steps < args.total_steps:
+        if goal is None:
+            # OGBench goal-conditioned envs provide a goal in reset info.
+            raise RuntimeError("Environment did not provide info['goal']; cannot act with HIQL.")
+
+        # Action selection.
+        rng, act_key = jax.random.split(rng)
+        base_action = np.asarray(
+            hiql_agent.sample_actions(observations=obs, goals=goal, temperature=0.0, seed=act_key),
+            dtype=np.float32,
+        )
+        action = base_action
+
+        if args.method == "pex":
+            # Linear ramp of the "expanded" policy weight.
+            mix = min(1.0, total_env_steps / max(1, int(args.pex_mix_warmup))) * float(args.pex_mix_final)
+            sac_obs = np.concatenate([np.asarray(obs, np.float32), np.asarray(goal, np.float32)], axis=-1)
+            rng, sac_key = jax.random.split(rng)
+            sac_action = np.asarray(
+                sac_agent.sample_actions(observations=sac_obs, goals=None, temperature=1.0, seed=sac_key),
+                dtype=np.float32,
+            )
+            action = (1.0 - mix) * base_action + mix * sac_action
+
+        # Exploration noise (both methods).
+        if args.action_noise > 0:
+            action = action + np.random.normal(0.0, args.action_noise, size=action.shape).astype(np.float32)
+        action = np.clip(action, -1.0, 1.0)
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = bool(terminated or truncated)
+        next_goal = info.get("goal", goal)
+
+        episode_return += float(reward)
+        episode_len += 1
+
+        # Store transition in HIQL online buffer (for relabeling).
+        rb.add_transition(
+            dict(
+                observations=np.asarray(obs, dtype=np.float32),
+                actions=np.asarray(action, dtype=np.float32),
+                rewards=np.asarray(float(reward), dtype=np.float32),
+                masks=np.asarray(0.0 if done else 1.0, dtype=np.float32),
+                terminals=np.asarray(1.0 if done else 0.0, dtype=np.float32),
+                next_observations=np.asarray(next_obs, dtype=np.float32),
+            )
+        )
+        ep_index.push_and_maybe_close_episode(done)
+
+        if args.method == "pex":
+            sac_obs = np.concatenate([np.asarray(obs, np.float32), np.asarray(goal, np.float32)], axis=-1)
+            sac_next_obs = np.concatenate([np.asarray(next_obs, np.float32), np.asarray(next_goal, np.float32)], axis=-1)
+            sac_rb.add_transition(
+                dict(
+                    observations=sac_obs.astype(np.float32),
+                    actions=np.asarray(action, dtype=np.float32),
+                    rewards=np.asarray(float(reward), dtype=np.float32),
+                    masks=np.asarray(0.0 if done else 1.0, dtype=np.float32),
+                    next_observations=sac_next_obs.astype(np.float32),
+                )
+            )
+
+        total_env_steps += 1
+
+        # Online updates.
+        if total_env_steps >= args.start_updates_after:
+            if args.method == "online_hiql":
+                for _ in range(int(args.updates_per_step)):
+                    batch = sample_hgc_batch(rb, ep_index, args.batch_size, hiql_cfg)
+                    hiql_agent, _ = hiql_agent.update(batch)
+            else:
+                for _ in range(int(args.updates_per_step)):
+                    b = sac_rb.sample(args.sac_batch_size)
+                    sac_agent, _ = sac_agent.update(b)
+
+        # Periodic eval.
+        if args.eval_every and (total_env_steps % int(args.eval_every) == 0):
+            eval_hiql(total_env_steps)
+
+        if done:
+            print(f"[episode] steps={episode_len} return={episode_return:.3f}")
+            obs, info = env.reset(options=dict(task_id=args.task_id))
+            goal = info.get("goal")
+            episode_return = 0.0
+            episode_len = 0
+            continue
+
+        obs = next_obs
+        goal = next_goal
+
+    eval_hiql(total_env_steps)
+
+    # Save final weights.
+    save_dir = args.save_dir
+    if save_dir is None:
+        save_dir = f"experiments/online_ft_{args.method}_from{args.step}_plus{total_env_steps}"
+    save_dir = str(Path(save_dir).resolve())
+    os.makedirs(save_dir, exist_ok=True)
+    final_step = int(args.step) + int(total_env_steps)
+
+    hiql_out = os.path.join(save_dir, "hiql")
+    os.makedirs(hiql_out, exist_ok=True)
+    save_agent(hiql_agent, hiql_out, final_step)
+    print(f"[save] HIQL -> {hiql_out}/params_{final_step}.pkl")
+
+    if args.method == "pex":
+        sac_out = os.path.join(save_dir, "sac")
+        os.makedirs(sac_out, exist_ok=True)
+        save_agent(sac_agent, sac_out, final_step)
+        print(f"[save] SAC (pex) -> {sac_out}/params_{final_step}.pkl")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
+

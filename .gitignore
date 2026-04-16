@@ -7,3 +7,5 @@ venv/
 .venv/
 ogbench/
 OGBench/
+experiments/
+eval_videos/
