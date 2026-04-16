@@ -7,3 +7,6 @@ venv/
 .venv/
 ogbench/
 OGBench/
+__pycache__/
+*.pyc
+.DS_Storegenerated_assets/*.xml
