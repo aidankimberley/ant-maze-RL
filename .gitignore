@@ -10,3 +10,4 @@ OGBench/
 __pycache__/
 *.pyc
 .DS_Storegenerated_assets/*.xml
+generated_assets/*.xml
