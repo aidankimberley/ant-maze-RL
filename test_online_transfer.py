@@ -221,7 +221,7 @@ def main():
 
     shifted_env, shift_spec = make_shifted_antmaze_env(
         env_name=args.env_name,
-        source_xml_path="generated_assets/ant.xml",
+        source_xml_path="generated_assets/antmaze-medium-navigate-v0_composite_shift_moderate.xml",
         generated_assets_dir="generated_assets",
         shift_family="friction",
         shift_level="moderate_low",
