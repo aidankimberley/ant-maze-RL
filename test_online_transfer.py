@@ -24,6 +24,8 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from envs.shifted_antmaze import make_shifted_antmaze_env
+from gymnasium.wrappers import TimeLimit
 
 import jax
 import numpy as np
@@ -214,7 +216,22 @@ def main():
     from utils.datasets import ReplayBuffer
 
     print(f"[env] Creating: {args.env_name}")
-    env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
+
+    # env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
+
+    shifted_env, shift_spec = make_shifted_antmaze_env(
+        env_name=args.env_name,
+        source_xml_path="generated_assets/ant.xml",
+        generated_assets_dir="generated_assets",
+        shift_family="friction",
+        shift_level="moderate_low",
+        render_mode="rgb_array",
+        add_noise_to_goal=False,
+    )
+
+    env = TimeLimit(shifted_env, max_episode_steps=1000)
+    print("[shift] using shifted env:", shift_spec)
+
     obs, info = env.reset(seed=args.seed, options=dict(task_id=args.task_id))
     goal = info.get("goal")
 
