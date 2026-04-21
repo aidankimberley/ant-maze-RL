@@ -27,6 +27,43 @@ import jax
 import numpy as np
 
 
+from pathlib import Path
+
+
+def _short_steps(n: int) -> str:
+    if n % 1000 == 0:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def _short_shift_name(shift_family: str | None, shift_level: str | None) -> str:
+    if shift_family is None or shift_level is None:
+        return "nominal"
+
+    family_map = {
+        "composite_shift": "comp",
+        "floor_friction": "floor",
+        "friction": "fric",
+        "joint_damping": "damp",
+        "actuator_gear": "gear",
+    }
+    fam = family_map.get(shift_family, shift_family.replace("_", ""))
+    return f"{fam}-{shift_level}"
+
+
+def make_default_save_dir(args) -> str:
+    method = "hiql" if args.method == "online_hiql" else "pex"
+    shift = _short_shift_name(args.shift_family, args.shift_level)
+    steps = _short_steps(int(args.total_steps))
+
+    parts = [method, shift, steps, f"s{args.seed}"]
+
+    run_name = getattr(args, "run_name", None)
+    if run_name:
+        parts.append(run_name)
+
+    return str((Path("results") / "_".join(parts)).resolve())
+
 def setup_imports():
     impls_dir = os.environ.get("OGBENCH_IMPLS", "")
     if not impls_dir:
@@ -243,12 +280,44 @@ def sample_mixed_hiql_batch(
     return _concat_batches(offline_batch, online_batch)
 
 
+def parse_task_ids(task_ids_str: str) -> list[int]:
+    vals = [int(x.strip()) for x in task_ids_str.split(",") if x.strip()]
+    if not vals:
+        raise ValueError("online_task_ids must contain at least one task id.")
+    for t in vals:
+        if t < 1 or t > 5:
+            raise ValueError(f"Task ids must be in [1,5], got {t}")
+    return vals
+
+
+def choose_next_task_id(
+    online_task_ids: list[int],
+    schedule: str,
+    episode_idx: int,
+    rng: np.random.RandomState,
+    fixed_task_id: int | None = None,
+) -> int:
+    if schedule == "fixed":
+        if fixed_task_id is None:
+            raise ValueError("fixed_task_id must be provided when schedule='fixed'.")
+        return fixed_task_id
+    if schedule == "cycle":
+        return online_task_ids[episode_idx % len(online_task_ids)]
+    if schedule == "random":
+        return int(rng.choice(online_task_ids))
+    raise ValueError(f"Unknown task schedule: {schedule}")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--env_name", type=str, default="antmaze-medium-navigate-v0")
-    parser.add_argument("--task_id", type=int, default=1)
+    parser.add_argument(
+        "--task_id",
+        type=int,
+        default=None,
+        help="Single-task training/eval task id. Required only when not using --multitask_online.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--method", type=str, default="online_hiql", choices=["online_hiql", "pex"])
     parser.add_argument("--total_steps", type=int, default=20_000)
@@ -259,6 +328,13 @@ def main():
     parser.add_argument("--eval_every", type=int, default=5_000)
     parser.add_argument("--eval_episodes", type=int, default=5)
     parser.add_argument("--save_dir", type=str, default=None, help="Where to save final fine-tuned weights.")
+
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Optional short suffix to distinguish runs, e.g. pilot, mix075, mt.",
+    )
 
     # mixed replay knobs
     parser.add_argument(
@@ -273,6 +349,26 @@ def main():
         help="Fraction of each HIQL update batch sampled from the offline dataset when --use_offline_replay is enabled.",
     )
 
+    parser.add_argument("--multitask_online", action="store_true")
+    parser.add_argument(
+        "--online_task_ids",
+        type=str,
+        default="1,2,3,4,5",
+        help="Comma-separated task ids used for online collection when --multitask_online is enabled.",
+    )
+    parser.add_argument(
+        "--task_schedule",
+        type=str,
+        default="fixed",
+        choices=["fixed", "cycle", "random"],
+        help="How to choose the next task for online collection.",
+    )
+    parser.add_argument(
+        "--eval_all_tasks_during_train",
+        action="store_true",
+        help="If set, periodic eval during training runs on all online_task_ids and prints mean/per-task success.",
+    )
+
     # PEX knobs (SAC expansion)
     parser.add_argument("--pex_mix_final", type=float, default=0.8)
     parser.add_argument("--pex_mix_warmup", type=int, default=5_000)
@@ -284,6 +380,36 @@ def main():
     parser.add_argument("--generated_assets_dir", type=str, default="generated_assets")
     parser.add_argument("--max_episode_steps", type=int, default=500)
     args = parser.parse_args()
+
+    online_task_ids = parse_task_ids(args.online_task_ids)
+
+    if args.multitask_online:
+        if args.task_schedule == "fixed":
+            args.task_schedule = "cycle"
+        fixed_task_id = online_task_ids[0]
+    else:
+        if args.task_id is None:
+            raise ValueError("--task_id is required when not using --multitask_online.")
+        online_task_ids = [args.task_id]
+        args.task_schedule = "fixed"
+        fixed_task_id = args.task_id
+
+    task_rng = np.random.RandomState(args.seed)
+    current_episode_idx = 0
+    current_task_id = choose_next_task_id(
+        online_task_ids=online_task_ids,
+        schedule=args.task_schedule,
+        episode_idx=current_episode_idx,
+        rng=task_rng,
+        fixed_task_id=fixed_task_id,
+    )
+
+    print(
+        f"[tasks] multitask_online={args.multitask_online} "
+        f"schedule={args.task_schedule} "
+        f"online_task_ids={online_task_ids} "
+        f"start_task={current_task_id}"
+    )
 
     checkpoint_dir = Path(args.checkpoint_dir).resolve()
     if not checkpoint_dir.is_dir():
@@ -350,7 +476,7 @@ def main():
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
 >>>>>>> 415467a (added offline buffer replay mixing)
 
-    obs, info = env.reset(seed=args.seed, options=dict(task_id=args.task_id))
+    obs, info = env.reset(seed=args.seed, options=dict(task_id=current_task_id))
     goal = info.get("goal")
 
     # HIQL config: mirror the same knobs used in offline runs.
@@ -429,17 +555,33 @@ def main():
         sac_rb = ReplayBuffer.create(sac_example, size=max_buf)
 
     def eval_hiql(step: int):
-        stats, _, _ = ogbench_evaluate(
-            hiql_agent,
-            env,
-            task_id=args.task_id,
-            config=hiql_cfg,
-            num_eval_episodes=args.eval_episodes,
-            num_video_episodes=0,
-        )
-        succ = float(stats.get("success", 0.0))
-        print(f"[eval] step={step} success={succ:.3f}")
+        if args.eval_all_tasks_during_train:
+            task_successes = {}
+            for task_id in online_task_ids:
+                stats, _, _ = ogbench_evaluate(
+                    hiql_agent,
+                    env,
+                    task_id=task_id,
+                    config=hiql_cfg,
+                    num_eval_episodes=args.eval_episodes,
+                    num_video_episodes=0,
+                )
+                task_successes[task_id] = float(stats.get("success", 0.0))
 
+            mean_succ = float(np.mean(list(task_successes.values())))
+            detail = " ".join([f"task{tid}={succ:.3f}" for tid, succ in task_successes.items()])
+            print(f"[eval] step={step} mean_success={mean_succ:.3f} {detail}")
+        else:
+            stats, _, _ = ogbench_evaluate(
+                hiql_agent,
+                env,
+                task_id=args.task_id,
+                config=hiql_cfg,
+                num_eval_episodes=args.eval_episodes,
+                num_video_episodes=0,
+            )
+            succ = float(stats.get("success", 0.0))
+            print(f"[eval] step={step} task={args.task_id} success={succ:.3f}")
     total_env_steps = 0
     episode_return = 0.0
     episode_len = 0
@@ -535,8 +677,20 @@ def main():
             eval_hiql(total_env_steps)
 
         if done:
-            print(f"[episode] steps={episode_len} return={episode_return:.3f}")
-            obs, info = env.reset(options=dict(task_id=args.task_id))
+            print(
+                f"[episode] task={current_task_id} "
+                f"steps={episode_len} return={episode_return:.3f}"
+            )
+            current_episode_idx += 1
+            current_task_id = choose_next_task_id(
+                online_task_ids=online_task_ids,
+                schedule=args.task_schedule,
+                episode_idx=current_episode_idx,
+                rng=task_rng,
+                fixed_task_id=args.task_id,
+            )
+
+            obs, info = env.reset(options=dict(task_id=current_task_id))
             goal = info.get("goal")
             episode_return = 0.0
             episode_len = 0
@@ -551,8 +705,7 @@ def main():
     # Save final weights.
     save_dir = args.save_dir
     if save_dir is None:
-        suffix = "_mixed" if (args.method == "online_hiql" and args.use_offline_replay) else ""
-        save_dir = f"experiments/online_ft_{args.method}{suffix}_from{args.step}_plus{total_env_steps}"
+        save_dir = make_default_save_dir(args)
     save_dir = str(Path(save_dir).resolve())
     os.makedirs(save_dir, exist_ok=True)
     final_step = int(args.step) + int(total_env_steps)
