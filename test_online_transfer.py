@@ -430,7 +430,6 @@ def main():
     from envs.shifted_maze_factory import make_maze_env
 
     print(f"[env] Creating: {args.env_name}")
-<<<<<<< HEAD
 
     # env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
 
@@ -446,7 +445,6 @@ def main():
 
     env = TimeLimit(shifted_env, max_episode_steps=1000)
     print("[shift] using shifted env:", shift_spec)
-=======
     if args.shift_family is None or args.shift_level is None:
         # nominal env
         maze_type = args.env_name.split("-")[1]
@@ -474,7 +472,6 @@ def main():
         print(f"[env] Using shifted XML: {spec.generated_xml_path}")
 
     env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
->>>>>>> 415467a (added offline buffer replay mixing)
 
     obs, info = env.reset(seed=args.seed, options=dict(task_id=current_task_id))
     goal = info.get("goal")
