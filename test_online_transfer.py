@@ -431,20 +431,6 @@ def main():
 
     print(f"[env] Creating: {args.env_name}")
 
-    # env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
-
-    shifted_env, shift_spec = make_shifted_antmaze_env(
-        env_name=args.env_name,
-        source_xml_path="generated_assets/antmaze-medium-navigate-v0_composite_shift_moderate.xml",
-        generated_assets_dir="generated_assets",
-        shift_family="friction",
-        shift_level="moderate_low",
-        render_mode="rgb_array",
-        add_noise_to_goal=False,
-    )
-
-    env = TimeLimit(shifted_env, max_episode_steps=1000)
-    print("[shift] using shifted env:", shift_spec)
     if args.shift_family is None or args.shift_level is None:
         # nominal env
         maze_type = args.env_name.split("-")[1]
@@ -684,7 +670,7 @@ def main():
                 schedule=args.task_schedule,
                 episode_idx=current_episode_idx,
                 rng=task_rng,
-                fixed_task_id=args.task_id,
+                fixed_task_id=fixed_task_id,
             )
 
             obs, info = env.reset(options=dict(task_id=current_task_id))
