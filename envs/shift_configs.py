@@ -48,20 +48,20 @@ SHIFT_CONFIGS = {
         "actuator_gear": 30.0,
     },
     "mild": {
-    "floor_friction": (1.5, 0.75, 0.75),
-    "joint_damping": 2.2,
-    "actuator_gear": 24.0,
-},
+        "floor_friction": (1.5, 0.75, 0.75),
+        "joint_damping": 2.2,
+        "actuator_gear": 24.0,
+    },
     "moderate": {
         "floor_friction": (1.8, 0.9, 0.9),
         "joint_damping": 2.8,
         "actuator_gear": 22.0,
     },
     "severe": {
-    "floor_friction": (2.0, 1.0, 1.0),
-    "joint_damping": 3.0,
-    "actuator_gear": 21.0,
-},
+        "floor_friction": (2.0, 1.0, 1.0),
+        "joint_damping": 3.0,
+        "actuator_gear": 21.0,
+    },
 }
 }
 

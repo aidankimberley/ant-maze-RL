@@ -9,14 +9,10 @@ Two modes:
 - pex: "policy expansion" by training an online SAC policy on (obs, goal) while executing a
   convex combination of (frozen) HIQL and SAC actions with a ramped mixing coefficient.
 
-Example:
-PYTHONPATH="$(pwd)/ogbench:$PYTHONPATH" python test_online_transfer.py \
-  --checkpoint_dir ./experiments/checkpoint_300000 \
-  --step 300000 \
-  --env_name antmaze-medium-navigate-v0 \
-  --task_id 1 \
-  --method online_hiql \
-  --total_steps 20000
+Added here:
+- optional mixed replay for online_hiql:
+  sample part of each update batch from the original offline OGBench dataset
+  and the rest from the growing online shifted replay buffer.
 """
 
 import argparse
@@ -77,7 +73,6 @@ class OnlineEpisodesIndex:
     """
     Tracks episode boundaries for a growing, non-circular buffer.
     """
-
     episode_end: np.ndarray  # shape (max_size,), int32 (filled for [0, size))
     size: int = 0
     cur_ep_start: int = 0
@@ -113,7 +108,6 @@ def sample_hgc_batch(buffer, idx: OnlineEpisodesIndex, batch_size: int, cfg) -> 
         raise RuntimeError("Not enough online data yet to sample a batch.")
 
     # only sample indices whose episode_end is known (i.e., episode finished)
-    # otherwise we can't safely sample future goals within the episode.
     valid = np.nonzero(idx.episode_end[:n] >= 0)[0]
     if len(valid) == 0:
         raise RuntimeError("No completed episodes in buffer yet.")
@@ -133,11 +127,12 @@ def sample_hgc_batch(buffer, idx: OnlineEpisodesIndex, batch_size: int, cfg) -> 
         hi = final_state_idxs
         traj_goal_idxs = np.round(lo * distances + hi * (1.0 - distances)).astype(np.int64)
 
-    # choose between traj and random for the (1 - p_curgoal) mass, then sprinkle in curgoal
     if float(cfg["value_p_curgoal"]) == 1.0:
         value_goal_idxs = idxs
     else:
-        pick_traj = np.random.rand(batch_size) < (cfg["value_p_trajgoal"] / (1.0 - cfg["value_p_curgoal"]))
+        pick_traj = np.random.rand(batch_size) < (
+            cfg["value_p_trajgoal"] / (1.0 - cfg["value_p_curgoal"])
+        )
         value_goal_idxs = np.where(pick_traj, traj_goal_idxs, random_goal_idxs)
         pick_cur = np.random.rand(batch_size) < cfg["value_p_curgoal"]
         value_goal_idxs = np.where(pick_cur, idxs, value_goal_idxs)
@@ -159,16 +154,21 @@ def sample_hgc_batch(buffer, idx: OnlineEpisodesIndex, batch_size: int, cfg) -> 
         hi = final_state_idxs
         high_traj_goal_idxs = np.round(lo * distances + hi * (1.0 - distances)).astype(np.int64)
 
-    high_traj_target_idxs = np.minimum(idxs + int(cfg["subgoal_steps"]), high_traj_goal_idxs)
+    high_traj_target_idxs = np.minimum(
+        idxs + int(cfg["subgoal_steps"]), high_traj_goal_idxs
+    )
 
     high_random_goal_idxs = valid[np.random.randint(len(valid), size=batch_size)]
-    high_random_target_idxs = np.minimum(idxs + int(cfg["subgoal_steps"]), final_state_idxs)
+    high_random_target_idxs = np.minimum(
+        idxs + int(cfg["subgoal_steps"]), final_state_idxs
+    )
 
     pick_random = np.random.rand(batch_size) < cfg["actor_p_randomgoal"]
     high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
-    high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+    high_target_idxs = np.where(
+        pick_random, high_random_target_idxs, high_traj_target_idxs
+    )
 
-    # Gather data from the underlying ReplayBuffer (a FrozenDict-like Dataset).
     batch = buffer.sample(batch_size, idxs)
     batch["rewards"] = rewards.astype(np.float32)
     batch["masks"] = masks.astype(np.float32)
@@ -176,7 +176,71 @@ def sample_hgc_batch(buffer, idx: OnlineEpisodesIndex, batch_size: int, cfg) -> 
     batch["low_actor_goals"] = buffer["observations"][low_goal_idxs]
     batch["high_actor_goals"] = buffer["observations"][high_goal_idxs]
     batch["high_actor_targets"] = buffer["observations"][high_target_idxs]
+    batch["valids"] = np.ones((batch_size,), dtype=np.float32)
     return batch
+
+
+def _batch_to_numpy_dict(batch: dict) -> dict:
+    return {k: np.asarray(v) for k, v in batch.items()}
+
+
+def _concat_batches(batch_a: dict, batch_b: dict) -> dict:
+    if batch_a is None:
+        return _batch_to_numpy_dict(batch_b)
+    if batch_b is None:
+        return _batch_to_numpy_dict(batch_a)
+
+    a = _batch_to_numpy_dict(batch_a)
+    b = _batch_to_numpy_dict(batch_b)
+
+    keys_a = set(a.keys())
+    keys_b = set(b.keys())
+    if keys_a != keys_b:
+        raise KeyError(
+            f"Batch key mismatch.\nA only: {sorted(keys_a - keys_b)}\nB only: {sorted(keys_b - keys_a)}"
+        )
+
+    out = {}
+    for k in a.keys():
+        out[k] = np.concatenate([a[k], b[k]], axis=0)
+    return out
+
+
+def sample_mixed_hiql_batch(
+    offline_dataset,
+    online_buffer,
+    online_index: OnlineEpisodesIndex,
+    batch_size: int,
+    cfg,
+    offline_fraction: float,
+):
+    """
+    Mix an offline HIQL/HGC batch with an online relabeled HIQL batch.
+
+    offline_fraction = fraction of the total batch sampled from the offline dataset.
+    If online data is not ready yet, falls back to offline-only.
+    """
+    offline_fraction = float(np.clip(offline_fraction, 0.0, 1.0))
+
+    if offline_dataset is None or offline_fraction <= 0.0:
+        return sample_hgc_batch(online_buffer, online_index, batch_size, cfg)
+
+    if offline_fraction >= 1.0:
+        return _batch_to_numpy_dict(offline_dataset.sample(batch_size))
+
+    offline_bs = int(round(batch_size * offline_fraction))
+    offline_bs = min(max(offline_bs, 1), batch_size - 1)
+    online_bs = batch_size - offline_bs
+
+    offline_batch = _batch_to_numpy_dict(offline_dataset.sample(offline_bs))
+
+    try:
+        online_batch = sample_hgc_batch(online_buffer, online_index, online_bs, cfg)
+    except RuntimeError:
+        # Early in training, no completed online episodes yet.
+        return _batch_to_numpy_dict(offline_dataset.sample(batch_size))
+
+    return _concat_batches(offline_batch, online_batch)
 
 
 def main():
@@ -195,10 +259,30 @@ def main():
     parser.add_argument("--eval_every", type=int, default=5_000)
     parser.add_argument("--eval_episodes", type=int, default=5)
     parser.add_argument("--save_dir", type=str, default=None, help="Where to save final fine-tuned weights.")
+
+    # mixed replay knobs
+    parser.add_argument(
+        "--use_offline_replay",
+        action="store_true",
+        help="For online_hiql, mix the original offline OGBench dataset into each update batch.",
+    )
+    parser.add_argument(
+        "--offline_batch_fraction",
+        type=float,
+        default=0.75,
+        help="Fraction of each HIQL update batch sampled from the offline dataset when --use_offline_replay is enabled.",
+    )
+
     # PEX knobs (SAC expansion)
     parser.add_argument("--pex_mix_final", type=float, default=0.8)
     parser.add_argument("--pex_mix_warmup", type=int, default=5_000)
     parser.add_argument("--sac_batch_size", type=int, default=256)
+
+    parser.add_argument("--source_xml", type=str, default=None)
+    parser.add_argument("--shift_family", type=str, default=None)
+    parser.add_argument("--shift_level", type=str, default=None)
+    parser.add_argument("--generated_assets_dir", type=str, default="generated_assets")
+    parser.add_argument("--max_episode_steps", type=int, default=500)
     args = parser.parse_args()
 
     checkpoint_dir = Path(args.checkpoint_dir).resolve()
@@ -213,9 +297,14 @@ def main():
     import ogbench
     from utils.flax_utils import restore_agent, save_agent
     from utils.evaluation import evaluate as ogbench_evaluate
-    from utils.datasets import ReplayBuffer
+    from utils.datasets import ReplayBuffer, Dataset, HGCDataset
+
+    from gymnasium.wrappers import TimeLimit
+    from envs.shifted_antmaze import make_shifted_antmaze_env
+    from envs.shifted_maze_factory import make_maze_env
 
     print(f"[env] Creating: {args.env_name}")
+<<<<<<< HEAD
 
     # env = ogbench.make_env_and_datasets(args.env_name, env_only=True)
 
@@ -231,6 +320,35 @@ def main():
 
     env = TimeLimit(shifted_env, max_episode_steps=1000)
     print("[shift] using shifted env:", shift_spec)
+=======
+    if args.shift_family is None or args.shift_level is None:
+        # nominal env
+        maze_type = args.env_name.split("-")[1]
+        env = make_maze_env(
+            loco_env_type="ant",
+            maze_env_type="maze",
+            maze_type=maze_type,
+            ob_type="states",
+            render_mode="rgb_array",
+            add_noise_to_goal=False,
+        )
+    else:
+        if args.source_xml is None:
+            raise ValueError("--source_xml is required when using a shifted environment.")
+
+        env, spec = make_shifted_antmaze_env(
+            env_name=args.env_name,
+            source_xml_path=args.source_xml,
+            generated_assets_dir=args.generated_assets_dir,
+            shift_family=args.shift_family,
+            shift_level=args.shift_level,
+            render_mode="rgb_array",
+            add_noise_to_goal=False,
+        )
+        print(f"[env] Using shifted XML: {spec.generated_xml_path}")
+
+    env = TimeLimit(env, max_episode_steps=args.max_episode_steps)
+>>>>>>> 415467a (added offline buffer replay mixing)
 
     obs, info = env.reset(seed=args.seed, options=dict(task_id=args.task_id))
     goal = info.get("goal")
@@ -253,8 +371,23 @@ def main():
     hiql_agent = restore_agent(hiql_agent, str(checkpoint_dir), args.step)
     print(f"[restore] HIQL restored from {checkpoint_dir} @ step {args.step}")
 
+    # Optional offline dataset for mixed replay.
+    offline_hiql_dataset = None
+    if args.method == "online_hiql" and args.use_offline_replay:
+        print(f"[offline] Loading OGBench dataset for {args.env_name}")
+        _, train_dataset_dict, _ = ogbench.make_env_and_datasets(
+            args.env_name,
+            compact_dataset=True,
+        )
+        offline_n = int(train_dataset_dict["observations"].shape[0])
+        base_dataset = Dataset.create(**train_dataset_dict)
+        offline_hiql_dataset = HGCDataset(base_dataset, hiql_cfg)
+        print(
+            f"[offline] loaded {offline_n} transitions | "
+            f"offline_batch_fraction={args.offline_batch_fraction:.2f}"
+        )
+
     # Online buffers.
-    # We use a non-circular buffer sized to total_steps (+ a little room) so episode indexing is simple.
     max_buf = int(args.total_steps) + 10_000
     example_transition = dict(
         observations=np.asarray(obs, dtype=np.float32),
@@ -273,6 +406,7 @@ def main():
     sac_rb = None
     if args.method == "pex":
         from agents.sac import get_config as sac_get_config
+        from agents.sac import SACAgent
 
         if goal is None:
             raise RuntimeError("PEX mode requires env to provide info['goal'].")
@@ -282,7 +416,6 @@ def main():
         ex_obs_sac = np.concatenate([np.asarray(obs, np.float32), np.asarray(goal, np.float32)], axis=-1)
         ex_obs_sac = ex_obs_sac[None, :]
         ex_act = np.asarray([env.action_space.sample()], dtype=np.float32)
-        from agents.sac import SACAgent
 
         sac_agent = SACAgent.create(args.seed, ex_obs_sac, ex_act, sac_cfg)
 
@@ -315,7 +448,6 @@ def main():
     print(f"[run] method={args.method} total_steps={args.total_steps}")
     while total_env_steps < args.total_steps:
         if goal is None:
-            # OGBench goal-conditioned envs provide a goal in reset info.
             raise RuntimeError("Environment did not provide info['goal']; cannot act with HIQL.")
 
         # Action selection.
@@ -327,7 +459,6 @@ def main():
         action = base_action
 
         if args.method == "pex":
-            # Linear ramp of the "expanded" policy weight.
             mix = min(1.0, total_env_steps / max(1, int(args.pex_mix_warmup))) * float(args.pex_mix_final)
             sac_obs = np.concatenate([np.asarray(obs, np.float32), np.asarray(goal, np.float32)], axis=-1)
             rng, sac_key = jax.random.split(rng)
@@ -381,7 +512,18 @@ def main():
         if total_env_steps >= args.start_updates_after:
             if args.method == "online_hiql":
                 for _ in range(int(args.updates_per_step)):
-                    batch = sample_hgc_batch(rb, ep_index, args.batch_size, hiql_cfg)
+                    if offline_hiql_dataset is not None:
+                        batch = sample_mixed_hiql_batch(
+                            offline_dataset=offline_hiql_dataset,
+                            online_buffer=rb,
+                            online_index=ep_index,
+                            batch_size=args.batch_size,
+                            cfg=hiql_cfg,
+                            offline_fraction=args.offline_batch_fraction,
+                        )
+                    else:
+                        batch = sample_hgc_batch(rb, ep_index, args.batch_size, hiql_cfg)
+
                     hiql_agent, _ = hiql_agent.update(batch)
             else:
                 for _ in range(int(args.updates_per_step)):
@@ -403,12 +545,14 @@ def main():
         obs = next_obs
         goal = next_goal
 
-    eval_hiql(total_env_steps)
+    if (not args.eval_every) or (total_env_steps % int(args.eval_every) != 0):
+        eval_hiql(total_env_steps)
 
     # Save final weights.
     save_dir = args.save_dir
     if save_dir is None:
-        save_dir = f"experiments/online_ft_{args.method}_from{args.step}_plus{total_env_steps}"
+        suffix = "_mixed" if (args.method == "online_hiql" and args.use_offline_replay) else ""
+        save_dir = f"experiments/online_ft_{args.method}{suffix}_from{args.step}_plus{total_env_steps}"
     save_dir = str(Path(save_dir).resolve())
     os.makedirs(save_dir, exist_ok=True)
     final_step = int(args.step) + int(total_env_steps)
@@ -429,4 +573,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

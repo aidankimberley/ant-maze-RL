@@ -9,12 +9,6 @@ import pandas as pd
 
 SHIFT_ORDER = [
     "base",
-    "mild_low",
-    "moderate_low",
-    "severe_low",
-    "mild_high",
-    "moderate_high",
-    "severe_high",
     "mild",
     "moderate",
     "severe",
@@ -22,12 +16,6 @@ SHIFT_ORDER = [
 
 SHIFT_LABELS = {
     "base": "base",
-    "mild_low": "mild low",
-    "moderate_low": "mod low",
-    "severe_low": "sev low",
-    "mild_high": "mild high",
-    "moderate_high": "mod high",
-    "severe_high": "sev high",
     "mild": "mild",
     "moderate": "moderate",
     "severe": "severe",
