@@ -12,15 +12,15 @@ The report lives in `final_report.tex` (NeurIPS style via `neurips.sty`).
 
 ### Offline sensitivity + learning curve
 
-![HIQL Offline Sweep](Screenshot%202026-04-23%20at%206.39.06%20PM.png)
+![HIQL Offline Sweep](results/Screenshot%202026-04-23%20at%206.39.06%20PM.png)
 
-![Offline HIQL performance vs training steps](Screenshot%202026-04-23%20at%206.39.58%20PM.png)
+![Offline HIQL performance vs training steps](results/Screenshot%202026-04-23%20at%206.39.58%20PM.png)
 
 ### Nominal vs shifted physics (frozen baseline vs online finetuned)
 
-![Success across nominal and moderate shift](Screenshot%202026-04-24%20at%202.16.39%20PM.png)
+![Success across nominal and moderate shift](results/Screenshot%202026-04-24%20at%202.16.39%20PM.png)
 
-![Success across nominal/friction/composite shifts](Screenshot%202026-04-24%20at%202.27.42%20PM.png)
+![Success across nominal/friction/composite shifts](results/Screenshot%202026-04-24%20at%202.27.42%20PM.png)
 
 ## Setup
 
