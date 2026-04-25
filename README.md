@@ -18,7 +18,6 @@ This repo is a course project (McGill University) exploring a **sim-to-real-styl
 
 ### Nominal vs shifted physics (frozen baseline vs online finetuned)
 
-![Success across nominal and moderate shift](results/Screenshot%202026-04-24%20at%202.16.39%20PM.png)
 
 ![Success across nominal/friction/composite shifts](results/Screenshot%202026-04-24%20at%202.27.42%20PM.png)
 
