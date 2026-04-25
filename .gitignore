@@ -11,8 +11,7 @@ __pycache__/
 *.pyc
 .DS_Storegenerated_assets/*.xml
 generated_assets/*.xml
-results/*.csv
-results/*.png
+
 eval_videos/*
 experiments/*
 neurips.sty
