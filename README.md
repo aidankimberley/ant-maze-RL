@@ -6,9 +6,9 @@ This repo is a course project (McGill University) exploring a **sim-to-real-styl
 - **Physics shift**: modify MuJoCo XML physics parameters (e.g., friction/damping/gear) to create a controlled dynamics mismatch.
 - **Online fine-tuning**: continue HIQL training in the shifted environment to recover performance.
 
-The report lives in `final_report.tex` (NeurIPS style via `neurips.sty`).
 
-## Key results (plots used in the report)
+
+## Key results 
 
 ### Offline sensitivity + learning curve
 
@@ -55,7 +55,7 @@ python scripts/eval_hiql_nominal_vs_shifted.py \
   --source_xml ./generated_assets/antmaze-medium-navigate-v0_composite_shift_moderate.xml \
   --shift_family friction \
   --shift_levels moderate_low severe_high \
-  --episodes 10 \
+  --episodes 50 \
   --seed 0 \
   --out_csv ./experiments/eval_nominal_vs_shifted_step300000_seed0.csv
 ```
